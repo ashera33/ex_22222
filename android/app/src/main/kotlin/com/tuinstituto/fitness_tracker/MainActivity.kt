@@ -28,9 +28,10 @@ import kotlin.math.sqrt
 
 class MainActivity : FlutterFragmentActivity() {
 
-    private val BIOMETRIC_CHANNEL = "com.tuinstituto.fitness/biometric"
-    private val ACCELEROMETER_CHANNEL = "com.tuinstituto.fitness/accelerometer"
-    private val GPS_CHANNEL = "com.tuinstituto.fitness/gps"
+    private val BIOMETRIC_CHANNEL      = "com.tuinstituto.fitness/biometric"
+    private val ACCELEROMETER_CHANNEL  = "com.tuinstituto.fitness/accelerometer"
+    private val FALL_CHANNEL           = "com.tuinstituto.fitness/fall"
+    private val GPS_CHANNEL            = "com.tuinstituto.fitness/gps"
     private val LOCATION_PERMISSION_REQUEST_CODE = 1001
 
     private lateinit var executor: Executor
@@ -63,7 +64,7 @@ class MainActivity : FlutterFragmentActivity() {
         setupGpsChannel(flutterEngine)
     }
 
-    // ─── BIOMETRÍA (sin cambios) ───────────────────────────────────────────────
+    // ─── BIOMETRÍA ────────────────────────────────────────────────────────────
 
     private fun checkBiometricSupport(): Boolean {
         val biometricManager = BiometricManager.from(this)
@@ -104,128 +105,210 @@ class MainActivity : FlutterFragmentActivity() {
         biometricPrompt.authenticate(promptInfo)
     }
 
-    // ─── ACELERÓMETRO (mejorado para A03s sin giroscopio) ────────────────────
+    // ─── ACELERÓMETRO + DETECCIÓN DE CAÍDA ───────────────────────────────────
+    //
+    // Dos pipelines paralelos sobre el MISMO listener:
+    //
+    //   señal raw ──► [sin filtro]  ──► detección de caída  (SENSOR_DELAY_GAME)
+    //             └──► [filtro LPF] ──► pasos + actividad   (enviado cada 3 muestras)
+    //
+    // Lógica de caída (teléfono en mano):
+    //   Fase 1 — IMPACTO:   magnitud raw > 25 m/s²  (sacudida brusca)
+    //   Fase 2 — QUIETUD:   magnitud raw < 3  m/s²  dentro de 300 ms
+    //   Debounce 2 s:       no re-disparar mientras Flutter procesa el modal
 
     private fun setupAccelerometerChannel(flutterEngine: FlutterEngine) {
         val sensorManager = getSystemService(SENSOR_SERVICE) as SensorManager
 
-        // A03s: usar acelerómetro lineal si está disponible, si no el normal
-        val linearAccel = sensorManager.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)
-        val normalAccel = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        val linearAccel  = sensorManager.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)
+        val normalAccel  = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         val accelerometer = linearAccel ?: normalAccel
 
-        var stepCount = 0
-        var lastMagnitude = 0.0
-        var sensorEventListener: SensorEventListener? = null
+        // Umbral de pasos: acelerómetro lineal no incluye gravedad, el normal sí
+        val stepThreshold = if (linearAccel != null) 12.0 else 15.0
+        val sensorType    = if (linearAccel != null) "LINEAR" else "NORMAL"
 
-        // Ventana grande para suavizar ruido del A03s (sin giroscopio)
-        val windowSize = 25
+        // ── Estado pipeline actividad ─────────────────────────────────────────
+        var stepCount       = 0
+        var lastMagnitude   = 0.0
+        var filteredX       = 0f
+        var filteredY       = 0f
+        var filteredZ       = 0f
+        var firstSample     = true
+        val windowSize      = 25
         val magnitudeHistory = mutableListOf<Double>()
-        var sampleCount = 0
-        var lastActivityType = "stationary"
+        var sampleCount     = 0
+        var lastActivityType   = "stationary"
         var activityConfidence = 0
 
-        // Filtro paso bajo para reducir ruido de alta frecuencia
-        val alpha = 0.8f
-        var filteredX = 0f
-        var filteredY = 0f
-        var filteredZ = 0f
-        var firstSample = true
+        // ── Estado pipeline caída ─────────────────────────────────────────────
+        // Umbral de impacto: 25 m/s² coincide con el valor del UI de Flutter
+        val FALL_IMPACT_THRESHOLD  = 25.0   // m/s² — pico de sacudida brusca
+        val FALL_QUIET_THRESHOLD   =  3.0   // m/s² — quietud post-impacto
+        val FALL_QUIET_WINDOW_MS   = 300L   // ms — ventana para detectar quietud
+        val FALL_DEBOUNCE_MS       = 2000L  // ms — igual al debounce del UI Flutter
 
+        var fallImpactTime     = 0L   // timestamp del último pico detectado
+        var fallDebounceTime   = 0L   // timestamp del último evento enviado a Flutter
+        var waitingForQuiet    = false
+
+        // ── EventSinks ───────────────────────────────────────────────────────
+        var activitySink: EventChannel.EventSink? = null
+        var fallSink:     EventChannel.EventSink? = null
+
+        var sensorEventListener: SensorEventListener? = null
+
+        // Helper para registrar/des-registrar con la misma referencia
+        fun registerSensor() {
+            if (sensorEventListener != null) return
+
+            sensorEventListener = object : SensorEventListener {
+                override fun onSensorChanged(event: SensorEvent?) {
+                    event ?: return
+
+                    val rawX = event.values[0]
+                    val rawY = event.values[1]
+                    val rawZ = event.values[2]
+                    val now  = System.currentTimeMillis()
+
+                    // ── PIPELINE CAÍDA: señal RAW, sin filtro ────────────────
+                    val rawMag = sqrt(
+                        (rawX * rawX + rawY * rawY + rawZ * rawZ).toDouble()
+                    )
+
+                    // Fase 1: detectar pico de impacto
+                    if (rawMag > FALL_IMPACT_THRESHOLD &&
+                        (now - fallDebounceTime) > FALL_DEBOUNCE_MS) {
+                        fallImpactTime  = now
+                        waitingForQuiet = true
+                    }
+
+                    // Fase 2: dentro de la ventana de 300ms, buscar quietud
+                    if (waitingForQuiet &&
+                        (now - fallImpactTime) <= FALL_QUIET_WINDOW_MS &&
+                        rawMag < FALL_QUIET_THRESHOLD) {
+
+                        waitingForQuiet  = false
+                        fallDebounceTime = now
+                        // Enviar true a Flutter → activa el modal de caída
+                        fallSink?.success(true)
+                    }
+
+                    // Cancelar espera si la ventana expiró sin quietud
+                    if (waitingForQuiet &&
+                        (now - fallImpactTime) > FALL_QUIET_WINDOW_MS) {
+                        waitingForQuiet = false
+                    }
+
+                    // ── PIPELINE ACTIVIDAD: señal FILTRADA ───────────────────
+                    val currentVariance = if (magnitudeHistory.size >= 5) {
+                        val avg = magnitudeHistory.takeLast(5).average()
+                        magnitudeHistory.takeLast(5).map {
+                            (it - avg) * (it - avg)
+                        }.average()
+                    } else 0.0
+
+                    val alpha = if (currentVariance > 4.0) 0.6f else 0.8f
+
+                    if (firstSample) {
+                        filteredX = rawX; filteredY = rawY; filteredZ = rawZ
+                        firstSample = false
+                    } else {
+                        filteredX = alpha * filteredX + (1 - alpha) * rawX
+                        filteredY = alpha * filteredY + (1 - alpha) * rawY
+                        filteredZ = alpha * filteredZ + (1 - alpha) * rawZ
+                    }
+
+                    val filteredMag = sqrt(
+                        (filteredX * filteredX +
+                         filteredY * filteredY +
+                         filteredZ * filteredZ).toDouble()
+                    )
+
+                    magnitudeHistory.add(filteredMag)
+                    if (magnitudeHistory.size > windowSize) magnitudeHistory.removeAt(0)
+
+                    val avgMagnitude = magnitudeHistory.average()
+                    val variance = magnitudeHistory.map {
+                        (it - avgMagnitude) * (it - avgMagnitude)
+                    }.average()
+
+                    if (filteredMag > stepThreshold && lastMagnitude <= stepThreshold) stepCount++
+                    lastMagnitude = filteredMag
+
+                    val newActivityType = when {
+                        variance < 0.8 -> "stationary"
+                        variance < 4.0 -> "walking"
+                        else           -> "running"
+                    }
+
+                    if (newActivityType == lastActivityType) activityConfidence++
+                    else activityConfidence = 0
+
+                    val finalActivityType =
+                        if (activityConfidence >= 8) newActivityType else lastActivityType
+                    lastActivityType = newActivityType
+
+                    sampleCount++
+                    if (sampleCount >= 3) {
+                        sampleCount = 0
+                        activitySink?.success(mapOf(
+                            "stepCount"    to stepCount,
+                            "activityType" to finalActivityType,
+                            "magnitude"    to avgMagnitude,
+                            "variance"     to variance,
+                            "sensorType"   to sensorType
+                        ))
+                    }
+                }
+                override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+            }
+
+            // SENSOR_DELAY_GAME (20ms): necesario para capturar el pico de caída
+            // Para la actividad sería suficiente DELAY_UI, pero la caída manda
+            sensorManager.registerListener(
+                sensorEventListener,
+                accelerometer,
+                SensorManager.SENSOR_DELAY_GAME
+            )
+        }
+
+        fun unregisterSensor() {
+            sensorEventListener?.let { sensorManager.unregisterListener(it) }
+            sensorEventListener = null
+        }
+
+        // ── Canal de actividad ────────────────────────────────────────────────
         EventChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             ACCELEROMETER_CHANNEL
         ).setStreamHandler(object : EventChannel.StreamHandler {
             override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
-                sensorEventListener = object : SensorEventListener {
-                    override fun onSensorChanged(event: SensorEvent?) {
-                        event?.let {
-                            val rawX = it.values[0]
-                            val rawY = it.values[1]
-                            val rawZ = it.values[2]
-
-                            // Filtro paso bajo: elimina vibraciones y ruido rápido
-                            if (firstSample) {
-                                filteredX = rawX
-                                filteredY = rawY
-                                filteredZ = rawZ
-                                firstSample = false
-                            } else {
-                                filteredX = alpha * filteredX + (1 - alpha) * rawX
-                                filteredY = alpha * filteredY + (1 - alpha) * rawY
-                                filteredZ = alpha * filteredZ + (1 - alpha) * rawZ
-                            }
-
-                            val magnitude = sqrt(
-                                (filteredX * filteredX +
-                                 filteredY * filteredY +
-                                 filteredZ * filteredZ).toDouble()
-                            )
-
-                            // Ventana deslizante de 25 muestras
-                            magnitudeHistory.add(magnitude)
-                            if (magnitudeHistory.size > windowSize) {
-                                magnitudeHistory.removeAt(0)
-                            }
-                            val avgMagnitude = magnitudeHistory.average()
-
-                            // Varianza: mide cuánto varía la señal (clave para A03s)
-                            val variance = magnitudeHistory.map {
-                                (it - avgMagnitude) * (it - avgMagnitude)
-                            }.average()
-
-                            // Detección de pasos con señal filtrada
-                            if (magnitude > 12 && lastMagnitude <= 12) stepCount++
-                            lastMagnitude = magnitude
-
-                            // Clasificación por varianza (no por magnitud fija)
-                            val newActivityType = when {
-                                variance < 0.8 -> "stationary"   // sin movimiento real
-                                variance < 4.0 -> "walking"      // pasos regulares
-                                else           -> "running"      // impacto fuerte
-                            }
-
-                            // Requiere 8 lecturas consistentes para cambiar estado
-                            if (newActivityType == lastActivityType) {
-                                activityConfidence++
-                            } else {
-                                activityConfidence = 0
-                            }
-
-                            val finalActivityType =
-                                if (activityConfidence >= 8) newActivityType
-                                else lastActivityType
-
-                            lastActivityType = newActivityType
-
-                            // Enviar cada 3 muestras (reduce carga en Flutter)
-                            sampleCount++
-                            if (sampleCount >= 3) {
-                                sampleCount = 0
-                                events?.success(mapOf(
-                                    "stepCount"    to stepCount,
-                                    "activityType" to finalActivityType,
-                                    "magnitude"    to avgMagnitude,
-                                    "variance"     to variance
-                                ))
-                            }
-                        }
-                    }
-                    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
-                }
-
-                sensorManager.registerListener(
-                    sensorEventListener,
-                    accelerometer,
-                    SensorManager.SENSOR_DELAY_GAME
-                )
+                activitySink = events
+                registerSensor()
             }
             override fun onCancel(arguments: Any?) {
-                sensorEventListener?.let { sensorManager.unregisterListener(it) }
-                sensorEventListener = null
+                activitySink = null
+                if (fallSink == null) unregisterSensor()
             }
         })
 
+        // ── Canal de caída ────────────────────────────────────────────────────
+        EventChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            FALL_CHANNEL
+        ).setStreamHandler(object : EventChannel.StreamHandler {
+            override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                fallSink = events
+                registerSensor()
+            }
+            override fun onCancel(arguments: Any?) {
+                fallSink = null
+                if (activitySink == null) unregisterSensor()
+            }
+        })
+
+        // ── Control ───────────────────────────────────────────────────────────
         MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             "$ACCELEROMETER_CHANNEL/control"
@@ -239,7 +322,7 @@ class MainActivity : FlutterFragmentActivity() {
         }
     }
 
-    // ─── GPS (FusedLocationProvider — estable desde el primer punto) ──────────
+    // ─── GPS (optimizado para GPS L1 del A03s) ────────────────────────────────
 
     private fun setupGpsChannel(flutterEngine: FlutterEngine) {
         var locationCallback: LocationCallback? = null
@@ -298,17 +381,16 @@ class MainActivity : FlutterFragmentActivity() {
 
                 val locationRequest = LocationRequest.Builder(
                     Priority.PRIORITY_HIGH_ACCURACY,
-                    2000L                        // actualizar cada 2 segundos
+                    2000L
                 )
-                    .setMinUpdateDistanceMeters(1f)   // mínimo 1 metro de cambio
-                    .setWaitForAccurateLocation(true) // esperar señal precisa antes del primer punto
+                    .setMinUpdateDistanceMeters(1f)
+                    .setWaitForAccurateLocation(true)
                     .build()
 
                 locationCallback = object : LocationCallback() {
                     override fun onLocationResult(result: LocationResult) {
                         for (location in result.locations) {
-                            // Filtrar puntos con baja precisión (ruido GPS)
-                            if (location.accuracy <= 30f) {
+                            if (location.accuracy <= 20f) {
                                 events?.success(locationToMap(location))
                             }
                         }
